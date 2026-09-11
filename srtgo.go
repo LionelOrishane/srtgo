@@ -74,7 +74,17 @@ func InitSRT() {
 }
 
 // CleanupSRT - Cleanup SRT lib
+//
+// Stops the internal poll server before calling srt_cleanup, so SRT is not
+// torn down while a goroutine is still waiting inside srt_epoll_uwait.
+// Programs should call this before exiting: SRT runs its own receive-queue
+// threads, and letting the process exit while they are live lets libsrt's
+// global destructors free state underneath them.
+//
+// Note that srt_cleanup is reference counted against srt_startup, so this
+// only takes effect once the counts balance.
 func CleanupSRT() {
+	pollServerShutdown()
 	C.srt_cleanup()
 }
 
@@ -264,7 +274,7 @@ func (s *SrtSocket) SetPollTimeout(pollTimeout time.Duration) {
 }
 
 func (s *SrtSocket) SetDeadline(deadline time.Time) {
-	s.pd.setDeadline(deadline, ModeRead+ModeWrite)
+	s.pd.setDeadline(deadline, ModeReadWrite)
 }
 
 func (s *SrtSocket) SetReadDeadline(deadline time.Time) {
@@ -279,16 +289,19 @@ func (s *SrtSocket) SetWriteDeadline(deadline time.Time) {
 func (s *SrtSocket) Close() {
 
 	C.srt_close(s.socket)
+	socket := s.socket
 	s.socket = SRT_INVALID_SOCK
 	if !s.blocking {
 		s.pd.close()
 	}
 	callbackMutex.Lock()
-	if ptr, exists := listenCallbackMap[s.socket]; exists {
+	if ptr, exists := listenCallbackMap[socket]; exists {
 		gopointer.Unref(ptr)
+		delete(listenCallbackMap, socket)
 	}
-	if ptr, exists := connectCallbackMap[s.socket]; exists {
+	if ptr, exists := connectCallbackMap[socket]; exists {
 		gopointer.Unref(ptr)
+		delete(connectCallbackMap, socket)
 	}
 	callbackMutex.Unlock()
 }

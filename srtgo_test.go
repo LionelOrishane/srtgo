@@ -2,6 +2,7 @@ package srtgo
 
 import (
 	"math/rand"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,9 @@ func randomPort() uint16 {
 func TestNewSocket(t *testing.T) {
 	options := make(map[string]string)
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -28,6 +32,9 @@ func TestNewSocketBlocking(t *testing.T) {
 	options := make(map[string]string)
 	options["blocking"] = "true"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -38,6 +45,9 @@ func TestNewSocketLinger(t *testing.T) {
 	options := make(map[string]string)
 	options["linger"] = "1000"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket with linger")
@@ -57,6 +67,9 @@ func TestNewSocketWithTransType(t *testing.T) {
 	options := make(map[string]string)
 	options["transtype"] = "3"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -67,6 +80,9 @@ func TestNewSocketWithParameters(t *testing.T) {
 	options := make(map[string]string)
 	options["pbkeylen"] = "32"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -77,6 +93,9 @@ func TestNewSocketWithInt64Param(t *testing.T) {
 	options := make(map[string]string)
 	options["maxbw"] = "300000"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -87,6 +106,9 @@ func TestNewSocketWithBoolParam(t *testing.T) {
 	options := make(map[string]string)
 	options["enforcedencryption"] = "0"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -97,6 +119,9 @@ func TestNewSocketWithStringParam(t *testing.T) {
 	options := make(map[string]string)
 	options["passphrase"] = "11111111111"
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	if a == nil {
 		t.Error("Could not create a srt socket")
@@ -111,6 +136,9 @@ func TestListen(t *testing.T) {
 	options["transtype"] = "file"
 
 	a := NewSrtSocket("0.0.0.0", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 	err := a.Listen(2)
 	if err != nil {
 		t.Error("Error on testListen")
@@ -156,6 +184,12 @@ func AcceptHelper(numSockets int, port uint16, options map[string]string, t *tes
 		}
 		if sock == nil || addr == nil {
 			t.Error("Expected non-nil addr and sock")
+		}
+		//An accepted socket is a live connection of its own. Leaving it open
+		//keeps its multiplexer, and that multiplexer's SRT receive-queue
+		//thread, alive past the end of the test.
+		if sock != nil {
+			defer sock.Close()
 		}
 	}
 
@@ -206,6 +240,9 @@ func TestSetSockOptInt(t *testing.T) {
 	InitSRT()
 	options := make(map[string]string)
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	expected := 200
 	err := a.SetSockOptInt(SRTO_LATENCY, expected)
@@ -226,6 +263,9 @@ func TestSetSockOptString(t *testing.T) {
 	InitSRT()
 	options := make(map[string]string)
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	expected := "123"
 	err := a.SetSockOptString(SRTO_STREAMID, expected)
@@ -246,6 +286,9 @@ func TestSetSockOptBool(t *testing.T) {
 	InitSRT()
 	options := make(map[string]string)
 	a := NewSrtSocket("localhost", 8090, options)
+	if a != nil {
+		defer a.Close()
+	}
 
 	expected := true
 	err := a.SetSockOptBool(SRTO_MESSAGEAPI, expected)
@@ -259,5 +302,42 @@ func TestSetSockOptBool(t *testing.T) {
 	}
 	if v != expected {
 		t.Errorf("Failed to set SRTO_MESSAGEAPI expected %t, got %t\n", expected, v)
+	}
+}
+
+func TestClose(t *testing.T) {
+	InitSRT()
+
+	options := make(map[string]string)
+	options["blocking"] = "0"
+	options["transtype"] = "file"
+
+	a := NewSrtSocket("0.0.0.0", 8090, options)
+
+	a.SetListenCallback(func(socket *SrtSocket, version int, addr *net.UDPAddr, streamid string) bool {
+		return true
+	})
+	if len(listenCallbackMap) != 1 {
+		t.Error("Failed to set listen callback")
+	}
+
+	a.SetConnectCallback(func(socket *SrtSocket, err error, addr *net.UDPAddr, token int) {
+	})
+	if len(connectCallbackMap) != 1 {
+		t.Error("Failed to set connect callback")
+	}
+
+	err := a.Listen(2)
+	if err != nil {
+		t.Error("Error on testListen")
+	}
+
+	a.Close()
+
+	if len(listenCallbackMap) != 0 {
+		t.Error("Failed to delete listen callback")
+	}
+	if len(connectCallbackMap) != 0 {
+		t.Error("Failed to delete connect callback")
 	}
 }

@@ -6,10 +6,16 @@ package srtgo
 */
 import "C"
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// noDeadline arms a timer effectively forever (~292 years). A timer created
+// with a zero or negative duration fires immediately and leaves a stale tick
+// in its channel, which wait() would observe as a spurious deadline expiry.
+const noDeadline = time.Duration(math.MaxInt64)
 
 const (
 	pollDefault = int32(iota)
@@ -22,23 +28,33 @@ type PollMode int
 const (
 	ModeRead = PollMode(iota)
 	ModeWrite
+	// ModeReadWrite addresses the read and the write side at once. It must be
+	// its own value: ModeRead is 0, so the expression ModeRead+ModeWrite is
+	// just ModeWrite and cannot be distinguished from it.
+	ModeReadWrite
 )
 
 /*
 	pollDesc contains the polling state for the associated SrtSocket
 	closing: socket is closing, reject all poll operations
-	pollErr: an error occured on the socket, indicates it's not useable anymore.
+	pollErr: an error occured on the socket, indicates it's not useable anymore. 0 = no error, 1 = error.
 	unblockRd: is used to unblock the poller when the socket becomes ready for io
 	rdState: polling state for read operations
 	rdDeadline: deadline in NS before poll operation times out, -1 means timedout (needs to be cleared), 0 is without timeout
 	rdSeq: sequence number protects against spurious signalling of timeouts when timer is reset.
 	rdTimer: timer used to enforce deadline.
+
+	Concurrency note: pollErr, rdState and wrState are accessed by the pollServer
+	goroutine from unblock(), which deliberately holds no lock. They must
+	therefore be touched with sync/atomic ONLY -- a plain load or store here
+	is a data race against unblock()'s atomic.SwapInt32, even where pd.lock
+	or rdLock/wrLock is held, because unblock() takes neither.
 */
 type pollDesc struct {
 	lock       sync.Mutex
 	closing    bool
 	fd         C.SRTSOCKET
-	pollErr    bool
+	pollErr    int32
 	unblockRd  chan interface{}
 	rdState    int32
 	rdLock     sync.Mutex
@@ -61,24 +77,39 @@ var pdPool = sync.Pool{
 		return &pollDesc{
 			unblockRd: make(chan interface{}, 1),
 			unblockWr: make(chan interface{}, 1),
-			rdTimer:   time.NewTimer(0),
-			wdTimer:   time.NewTimer(0),
+			rdTimer:   time.NewTimer(noDeadline),
+			wdTimer:   time.NewTimer(noDeadline),
 		}
 	},
+}
+
+// stopTimer stops t and drains any tick already delivered to its channel, so
+// that a subsequent Reset cannot be observed as an immediate expiry. It must
+// not be called while a goroutine is selecting on t.C for this pollDesc.
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }
 
 func pollDescInit(s C.SRTSOCKET) *pollDesc {
 	pd := pdPool.Get().(*pollDesc)
 	pd.lock.Lock()
-	defer pd.lock.Unlock()
 	pd.fd = s
 	pd.rdState = pollDefault
 	pd.wrState = pollDefault
 	pd.pollS = pollServerCtx()
 	pd.closing = false
-	pd.pollErr = false
+	atomic.StoreInt32(&pd.pollErr, 0)
 	pd.rdSeq++
 	pd.wdSeq++
+	pd.lock.Unlock()
+	//This is defensive, the lock order inversion between pollDesc.lock and
+	//pollServer.pollDescLock is fixed for this side by the other change in
+	//pollServer.pollClose.
 	pd.pollS.pollOpen(pd)
 	return pd
 }
@@ -89,6 +120,10 @@ func (pd *pollDesc) release() {
 	if !pd.closing || pd.rdState == pollWait || pd.wrState == pollWait {
 		panic("returning open or blocked upon pollDesc")
 	}
+	//Timers are stopped and drained before the pollDesc goes back into the
+	//pool, so a leftover tick cannot be seen by the next socket to reuse it.
+	stopTimer(pd.rdTimer)
+	stopTimer(pd.wdTimer)
 	pd.fd = 0
 	pdPool.Put(pd)
 }
@@ -117,9 +152,9 @@ func (pd *pollDesc) wait(mode PollMode) error {
 	}
 
 	for {
-		old := *state
+		old := atomic.LoadInt32(state)
 		if old == pollReady {
-			*state = pollDefault
+			atomic.StoreInt32(state, pollDefault)
 			pd.lock.Unlock()
 			return nil
 		}
@@ -161,11 +196,14 @@ wait:
 
 func (pd *pollDesc) close() {
 	pd.lock.Lock()
-	defer pd.lock.Unlock()
 	if pd.closing {
+		pd.lock.Unlock()
 		return
 	}
 	pd.closing = true
+	//Lock order rule: pollClose holds pollDescLock while there is a chance
+	//that pollServer.run is waiting on pd.lock while holding pollDescLock
+	pd.lock.Unlock()
 	pd.pollS.pollClose(pd)
 }
 
@@ -180,7 +218,7 @@ func (pd *pollDesc) checkPollErr(mode PollMode) error {
 		return &SrtEpollTimeout{}
 	}
 
-	if pd.pollErr {
+	if atomic.LoadInt32(&pd.pollErr) != 0 {
 		return &SrtSocketClosed{}
 	}
 
@@ -197,12 +235,10 @@ func (pd *pollDesc) setDeadline(t time.Time, mode PollMode) {
 			d = -1
 		}
 	}
-	if mode == ModeRead || mode == ModeRead+ModeWrite {
+	if mode == ModeRead || mode == ModeReadWrite {
 		pd.rdSeq++
 		pd.rtSeq = pd.rdSeq
-		if pd.rdDeadline > 0 {
-			pd.rdTimer.Stop()
-		}
+		stopTimer(pd.rdTimer)
 		pd.rdDeadline = d
 		if d > 0 {
 			pd.rdTimer.Reset(time.Duration(d))
@@ -211,12 +247,10 @@ func (pd *pollDesc) setDeadline(t time.Time, mode PollMode) {
 			pd.unblock(ModeRead, false, false)
 		}
 	}
-	if mode == ModeWrite || mode == ModeRead+ModeWrite {
+	if mode == ModeWrite || mode == ModeReadWrite {
 		pd.wdSeq++
 		pd.wtSeq = pd.wdSeq
-		if pd.wdDeadline > 0 {
-			pd.wdTimer.Stop()
-		}
+		stopTimer(pd.wdTimer)
 		pd.wdDeadline = d
 		if d > 0 {
 			pd.wdTimer.Reset(time.Duration(d))
@@ -227,11 +261,14 @@ func (pd *pollDesc) setDeadline(t time.Time, mode PollMode) {
 	}
 }
 
+// unblock takes no pollDesc lock, on any path. setDeadline calls it while
+// holding pd.lock, so acquiring pd.lock here self-deadlocks on a non-reentrant
+// mutex -- the bug PR #72 fixed for the state update and left in the pollErr
+// branch. pollErr is therefore atomic, like rdState and wrState, and callers
+// are free to hold pd.lock, pollDescLock, or nothing at all.
 func (pd *pollDesc) unblock(mode PollMode, pollerr, ioready bool) {
 	if pollerr {
-		pd.lock.Lock()
-		pd.pollErr = pollerr
-		pd.lock.Unlock()
+		atomic.StoreInt32(&pd.pollErr, 1)
 	}
 	state := &pd.rdState
 	unblockChan := pd.unblockRd
@@ -239,12 +276,12 @@ func (pd *pollDesc) unblock(mode PollMode, pollerr, ioready bool) {
 		state = &pd.wrState
 		unblockChan = pd.unblockWr
 	}
-	pd.lock.Lock()
-	old := atomic.LoadInt32(state)
+	var old int32
 	if ioready {
-		atomic.StoreInt32(state, pollReady)
+		old = atomic.SwapInt32(state, pollReady)
+	} else {
+		old = atomic.LoadInt32(state)
 	}
-	pd.lock.Unlock()
 	if old == pollWait {
 		//make sure we never block here
 		select {
@@ -257,13 +294,15 @@ func (pd *pollDesc) unblock(mode PollMode, pollerr, ioready bool) {
 }
 
 func (pd *pollDesc) reset(mode PollMode) {
+	pd.lock.Lock()
+	defer pd.lock.Unlock()
 	if mode == ModeRead {
 		pd.rdLock.Lock()
-		pd.rdState = pollDefault
+		atomic.StoreInt32(&pd.rdState, pollDefault)
 		pd.rdLock.Unlock()
 	} else if mode == ModeWrite {
 		pd.wrLock.Lock()
-		pd.wrState = pollDefault
+		atomic.StoreInt32(&pd.wrState, pollDefault)
 		pd.wrLock.Unlock()
 	}
 }
